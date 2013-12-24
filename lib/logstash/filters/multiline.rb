@@ -263,11 +263,8 @@ class LogStash::Filters::Multiline < LogStash::Filters::Base
       return success
     #elsif input.is_a?(String)
     else
-      @logger.debug("what is input", :input => input, :to_s => input.to_s)
-      @logger.debug("what is grok", :grok => grok)
       # Convert anything else to string (number, hash, etc)
       match = grok.match(input.to_s)
-      @logger.debug("what is match", :match => match)
       return false if !match
 
       match.each_capture do |capture, value|
