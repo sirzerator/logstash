@@ -101,6 +101,24 @@ class LogStash::Filters::Multiline < LogStash::Filters::Base
   #     NUMBER \d+
   config :patterns_dir, :validate => :array, :default => []
 
+  # The fields to overwrite.
+  #
+  # This allows you to overwrite a value in a field that already exists.
+  #
+  # For example, if you have a syslog line in the 'message' field, you can
+  # overwrite the 'message' field with part of the match like so:
+  #
+  #     filter {
+  #       multiline {
+  #         pattern => "%{SYSLOGBASE} %{DATA:message}"
+  #         overwrite => [ "message" ]
+  #       }
+  #     }
+  #
+  #  In this case, a line like "May 29 16:37:11 sadness logger: hello world"
+  #  will be parsed and 'hello world' will overwrite the original message.
+  config :overwrite, :validate => :array, :default => []
+
   # Detect if we are running from a jarfile, pick the right path.
   @@patterns_path = Set.new
   if __FILE__ =~ /file:\/.*\.jar!.*/
@@ -118,6 +136,9 @@ class LogStash::Filters::Multiline < LogStash::Filters::Base
     # This filter needs to keep state.
     @types = Hash.new { |h,k| h[k] = [] }
     @pending = Hash.new
+
+    # a cache of capture name handler methods.
+    @handlers = {}
   end # def initialize
 
   public
@@ -153,23 +174,20 @@ class LogStash::Filters::Multiline < LogStash::Filters::Base
   def filter(event)
     return unless filter?(event)
 
-    if event["message"].is_a?(Array)
-      match = @grok.match(event["message"].first)
-    else
-      match = @grok.match(event["message"])
-    end
+    local_match = match(@grok, "message", event)
+
     key = event.sprintf(@stream_identity)
     pending = @pending[key]
 
     @logger.debug("Multiline", :pattern => @pattern, :message => event["message"],
-                  :match => match, :negate => @negate)
+                  :local_match => local_match, :negate => @negate)
 
     # Add negate option
-    match = (match and !@negate) || (!match and @negate)
+    local_match = (local_match and !@negate) || (!local_match and @negate)
 
     case @what
     when "previous"
-      if match
+      if local_match
         event.tag "multiline"
         # previous previous line is part of this event.
         # append it to the event and cancel it
@@ -191,9 +209,9 @@ class LogStash::Filters::Multiline < LogStash::Filters::Base
           @pending[key] = event
           event.cancel
         end # if/else pending
-      end # if/else match
+      end # if/else local_match
     when "next"
-      if match
+      if local_match
         event.tag "multiline"
         # this line is part of a multiline event, the next
         # line will be part, too, put it into pending.
@@ -212,7 +230,7 @@ class LogStash::Filters::Multiline < LogStash::Filters::Base
           event.overwrite(pending.to_hash)
           @pending.delete(key)
         end
-      end # if/else match
+      end # if/else local_match
     else
       # TODO(sissel): Make this part of the 'register' method.
       @logger.warn("Unknown multiline 'what' value.", :what => @what)
@@ -221,9 +239,104 @@ class LogStash::Filters::Multiline < LogStash::Filters::Base
     if !event.cancelled?
       event["message"] = event["message"].join("\n") if event["message"].is_a?(Array)
       event["@timestamp"] = event["@timestamp"].first if event["@timestamp"].is_a?(Array)
-      filter_matched(event) if match
+      filter_matched(event) if local_match
+    else
+      filter_matched(pending) if local_match
     end
   end # def filter
+
+  private
+  def match(grok, field, event)
+    input = event[field]
+    if input.is_a?(Array)
+      success = true
+      input.each do |input|
+        grok, match = grok.match(input)
+        if match
+          match.each_capture do |capture, value|
+            handle(capture, value, event)
+          end
+        else
+          success = false
+        end
+      end
+      return success
+    #elsif input.is_a?(String)
+    else
+      @logger.debug("what is input", :input => input, :to_s => input.to_s)
+      @logger.debug("what is grok", :grok => grok)
+      # Convert anything else to string (number, hash, etc)
+      match = grok.match(input.to_s)
+      @logger.debug("what is match", :match => match)
+      return false if !match
+
+      match.each_capture do |capture, value|
+        handle(capture, value, event)
+      end
+      return true
+    end
+  rescue StandardError => e
+    @logger.warn("Grok regexp threw exception", :exception => e.message)
+  end
+
+  private
+  def handle(capture, value, event)
+    handler = @handlers[capture] ||= compile_capture_handler(capture)
+    return handler.call(value, event)
+  end
+
+  private
+  def compile_capture_handler(capture)
+    # SYNTAX:SEMANTIC:TYPE
+    syntax, semantic, coerce = capture.split(":")
+
+    # each_capture do |fullname, value|
+    #   capture_handlers[fullname].call(value, event)
+    # end
+
+    code = []
+    code << "# for capture #{capture}"
+    code << "lambda do |value, event|"
+    #code << "  p :value => value, :event => event"
+    if semantic.nil?
+      if @named_captures_only
+        # Abort early if we are only keeping named (semantic) captures
+        # and this capture has no semantic name.
+        code << "  return"
+      else
+        field = syntax
+      end
+    else
+      field = semantic
+    end
+    code << "  return if value.nil? || value.empty?" unless @keep_empty_captures
+    if coerce
+      case coerce
+        when "int"; code << "  value = value.to_i"
+        when "float"; code << "  value = value.to_f"
+      end
+    end
+
+    code << "  # field: #{field}"
+    if @overwrite.include?(field)
+      code << "  event[field] = value"
+    else
+      code << "  v = event[field]"
+      code << "  if v.nil?"
+      code << "    event[field] = value"
+      code << "  elsif v.is_a?(Array)"
+      code << "    event[field] << value"
+      code << "  elsif v.is_a?(String)"
+      # Promote to array since we aren't overwriting.
+      code << "    event[field] = [v, value]"
+      code << "  end"
+    end
+    code << "  return"
+    code << "end"
+
+    #puts code
+    return eval(code.join("\n"), binding, "<grok capture #{capture}>")
+  end # def compile_capture_handler
 
   # Flush any pending messages. This is generally used for unit testing only.
   #
