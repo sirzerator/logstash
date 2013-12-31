@@ -119,6 +119,12 @@ class LogStash::Filters::Multiline < LogStash::Filters::Base
   #  will be parsed and 'hello world' will overwrite the original message.
   config :overwrite, :validate => :array, :default => []
 
+  # If true, only store named captures from grok.
+  config :named_captures_only, :validate => :boolean, :default => true
+
+  # If true, keep empty captures as event fields.
+  config :keep_empty_captures, :validate => :boolean, :default => false
+
   # Detect if we are running from a jarfile, pick the right path.
   @@patterns_path = Set.new
   if __FILE__ =~ /file:\/.*\.jar!.*/
