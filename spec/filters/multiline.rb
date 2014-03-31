@@ -1,8 +1,7 @@
 require "test_utils"
 require "logstash/filters/multiline"
 
-puts "MULTILINE FILTER TEST DISABLED"
-describe LogStash::Filters::Multiline, :if => false do
+describe LogStash::Filters::Multiline do
 
   extend LogStash::RSpec
 
@@ -16,11 +15,53 @@ describe LogStash::Filters::Multiline, :if => false do
     }
     CONFIG
 
-    sample [ "hello world", "   second line", "another first line" ] do
-      p subject.to_hash
+    sample [ "hello world", "   second line", "another first line", "not linked to previous" ] do
       insist { subject.length } == 2
       insist { subject[0]["message"] } == "hello world\n   second line"
+      insist { subject[0]["tags"] }.include?("multiline")
       insist { subject[1]["message"] } == "another first line"
+      reject { subject[1] }.include?("tags")
+    end
+  end
+
+  describe "multiline with add_tag" do
+    config <<-CONFIG
+    filter {
+      multiline {
+        pattern => "^\\s"
+        what => previous
+        add_tag => [ "test" ]
+      }
+    }
+    CONFIG
+
+    sample [ "hello world", "   second line", "another first line", "not linked to previous" ] do
+      insist { subject.length } == 2
+      insist { subject[0]["message"] } == "hello world\n   second line"
+      insist { subject[0]["tags"] }.include?("test")
+      insist { subject[1]["message"] } == "another first line"
+      reject { subject[1] }.include?("tags")
+    end
+  end
+
+  describe "multiline with add_field" do
+    config <<-CONFIG
+    filter {
+      multiline {
+        pattern => "^\\s"
+        what => previous
+        add_field => [ "test", "value" ]
+      }
+    }
+    CONFIG
+
+    sample [ "hello world", "   second line", "another first line", "not linked to previous" ] do
+      insist { subject.length } == 2
+      insist { subject[0]["message"] } == "hello world\n   second line"
+      insist { subject[0] }.include?("test")
+      insist { subject[0]["test"] } == "value"
+      insist { subject[1]["message"] } == "another first line"
+      reject { subject[1] }.include?("test")
     end
   end
 
@@ -35,9 +76,32 @@ describe LogStash::Filters::Multiline, :if => false do
     }
     CONFIG
 
-    sample [ "120913 12:04:33 first line", "second line", "third line" ] do
-      insist { subject.length } == 1
+    sample [ "120913 12:04:33 first line", "second line", "third line", "120913 12:05:25 another event", "120913 12:05:25 yet another event" ] do
+      insist { subject.length } == 2
       insist { subject[0]["message"] } ==  "120913 12:04:33 first line\nsecond line\nthird line"
+      insist { subject[1]["message"] } ==  "120913 12:05:25 another event"
+    end
+  end
+
+  describe "multiline using named grok patterns" do
+    config <<-CONFIG
+    filter {
+      multiline {
+        pattern => "^%{NUMBER:first} %{TIME:second}"
+        negate => true
+        what => previous
+      }
+    }
+    CONFIG
+
+    sample [ "120913 12:04:33 first line", "second line", "third line", "120913 12:05:25 another event", "120913 12:05:25 yet another event" ] do
+      insist { subject.length } == 2
+      insist { subject[0]["message"] } ==  "120913 12:04:33 first line\nsecond line\nthird line"
+      insist { subject[0] }.include?("first")
+      insist { subject[0]["first"] } == "120913"
+      insist { subject[0] }.include?("second")
+      insist { subject[0]["second"] } == "12:04:33"
+      insist { subject[1]["message"] } ==  "120913 12:05:25 another event"
     end
   end
 
@@ -73,17 +137,17 @@ describe LogStash::Filters::Multiline, :if => false do
     alllines = eventstream.flatten
 
     # Take whole events and mix them with other events (maintain order)
-    # This simulates a mixing of multiple streams being received 
+    # This simulates a mixing of multiple streams being received
     # and processed. It requires that the multiline filter correctly partition
     # by stream_identity
-    concurrent_stream = eventstream.flatten.count.times.collect do 
+    concurrent_stream = eventstream.flatten.count.times.collect do
       index = rand(eventstream.count)
       event = eventstream[index].shift
       eventstream.delete_at(index) if eventstream[index].empty?
       event
     end
 
-    sample concurrent_stream do 
+    sample concurrent_stream do
       insist { subject.count } == count
       subject.each_with_index do |event, i|
         #puts "#{i}/#{event["event"]}: #{event.to_json}"
@@ -110,9 +174,11 @@ describe LogStash::Filters::Multiline, :if => false do
       }
     CONFIG
 
-    sample [ "120913 12:04:33 first line", "120913 12:04:33 second line" ] do
+    sample [ "120913 12:04:33 first line", "120913 12:04:33 second line", "" ] do
       subject.each do |s|
-        insist { s.tags.find_index("nope").nil? && s.tags.find_index("dummy") != nil && !s.fields.has_key?("dummy2") } == true
+        insist { s["tags"] }.include?("dummy")
+        reject { s["tags"] }.include?("dummy2")
+        reject { s }.include?("dummy2")
       end
     end
   end 
