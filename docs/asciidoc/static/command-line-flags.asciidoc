@@ -1,0 +1,58 @@
+== Command-line flags
+
+[float]
+=== Pipeline
+
+The Logstash pipeline has the following flags. (You can use the `--help` flag to
+display this information.)
+
+[source,shell]
+----------------------------------
+-f, --config CONFIGFILE
+ Load the Logstash config from a specific file, directory, or a wildcard. If
+ given a directory or wildcard, config files will be read from the directory in
+ alphabetical order.
+
+-e CONFIGSTRING
+ Use the given string as the configuration data. Same syntax as the config file.
+ If not input is specified, 'stdin { type => stdin }' is default. If no output
+ is specified, 'stdout { codec => rubydebug }}' is default.
+
+-w, --filterworkers COUNT
+ Sets the number of filter workers to run (default: 1)
+
+--watchdog-timeout TIMEOUT
+ Set watchdog timeout value in seconds. Default is 10. This timeout is used to detect
+ stuck filters; stuck filters usually symptoms of bugs. When a filter takes longer than 
+ TIMEOUT seconds, it will cause Logstash to abort.
+
+-l, --log FILE
+ Log to a given path. Default is to log to stdout
+
+--verbose
+ Increase verbosity to the first level (info), less verbose.
+
+--debug
+ Increase verbosity to the last level (trace), more verbose.
+
+-V, --version
+  Display the version of Logstash.
+
+-p, --pluginpath
+  A path of where to find plugins. This flag can be given multiple times to include
+  multiple paths. Plugins are expected to be in a specific directory hierarchy:
+  'PATH/logstash/TYPE/NAME.rb' where TYPE is 'inputs' 'filters', 'outputs' or 'codecs'
+  and NAME is the name of the plugin.
+
+-t, --configtest
+  Checks configuration and then exit. Note that grok patterns are not checked for 
+  correctness with this flag
+
+-h, --help
+  Print help  
+
+-v
+ *DEPRECATED: see --verbose/debug* Increase verbosity. There are multiple levels
+ of verbosity available with '-vv' currently being the highest
+----------------------------------
+

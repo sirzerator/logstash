@@ -36,7 +36,6 @@ LS_USER=logstash
 LS_GROUP=logstash
 LS_HOME=/var/lib/logstash
 LS_HEAP_SIZE="500m"
-LS_JAVA_OPTS="-Djava.io.tmpdir=${LS_HOME}"
 LS_LOG_FILE=/var/log/logstash/$NAME.log
 LS_CONF_DIR=/etc/logstash/conf.d
 LS_OPEN_FILES=16384
@@ -68,19 +67,18 @@ do_start()
   fi
 
   if pidofproc -p "$PID_FILE" >/dev/null; then
-    failure
-    exit 99
+    exit 0
   fi
 
   # Prepare environment
   HOME="${HOME:-$LS_HOME}"
-  JAVA_OPTS="${LS_JAVA_OPTS}"
+  LS_JAVA_OPTS="${LS_JAVA_OPTS} -Djava.io.tmpdir=${LS_HOME}"
   ulimit -n ${LS_OPEN_FILES}
   cd "${LS_HOME}"
-  export PATH HOME JAVA_OPTS LS_HEAP_SIZE LS_JAVA_OPTS LS_USE_GC_LOGGING
+  export PATH HOME LS_HEAP_SIZE LS_JAVA_OPTS LS_USE_GC_LOGGING
   test -n "${JAVACMD}" && export JAVACMD
 
-  nice -n ${LS_NICE} runuser -s /bin/sh -c "exec $DAEMON $DAEMON_OPTS" ${LS_USER} > /dev/null 1>&1 < /dev/null &
+  nice -n ${LS_NICE} runuser -s /bin/sh -c "exec $DAEMON $DAEMON_OPTS" ${LS_USER} >> $LS_LOG_FILE 2>&1 < /dev/null &
 
   RETVAL=$?
   local PID=$!
@@ -89,7 +87,7 @@ do_start()
   JAVA_PID=$(ps axo ppid,pid | awk -v "ppid=$PID" '$1==ppid {print $2}')
   PID=${JAVA_PID:-$PID}
   echo $PID > $PID_FILE
-  [ $PID = $JAVA_PID ] && success
+  [ "$PID" = "$JAVA_PID" ] && success
 }
 
 #

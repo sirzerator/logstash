@@ -1,22 +1,29 @@
 # encoding: utf-8
 require "clamp" # gem 'clamp'
+require "logstash/environment"
 require "logstash/errors"
-require "i18n"
+require "uri"
+require "net/http"
+LogStash::Environment.load_locale!
 
 class LogStash::Agent < Clamp::Command
+  DEFAULT_INPUT = "input { stdin { type => stdin } }"
+  DEFAULT_OUTPUT = "output { stdout { codec => rubydebug } }"
+
   option ["-f", "--config"], "CONFIG_PATH",
     I18n.t("logstash.agent.flag.config"),
     :attribute_name => :config_path
 
   option "-e", "CONFIG_STRING",
-    I18n.t("logstash.agent.flag.config-string"),
+    I18n.t("logstash.agent.flag.config-string",
+           :default_input => DEFAULT_INPUT, :default_output => DEFAULT_OUTPUT),
     :default => "", :attribute_name => :config_string
 
   option ["-w", "--filterworkers"], "COUNT",
     I18n.t("logstash.agent.flag.filterworkers"),
     :attribute_name => :filter_workers, :default => 1, &:to_i
 
-  option "--watchdog-timeout", "SECONDS", 
+  option "--watchdog-timeout", "SECONDS",
     I18n.t("logstash.agent.flag.watchdog-timeout"),
     :default => 10, &:to_f
 
@@ -25,7 +32,7 @@ class LogStash::Agent < Clamp::Command
     :attribute_name => :log_file
 
   # Old support for the '-v' flag'
-  option "-v", :flag, 
+  option "-v", :flag,
     I18n.t("logstash.agent.flag.verbosity"),
     :attribute_name => :verbosity, :multivalued => true
 
@@ -36,10 +43,10 @@ class LogStash::Agent < Clamp::Command
   option ["-V", "--version"], :flag,
     I18n.t("logstash.agent.flag.version")
 
-  option ["-p", "--pluginpath"] , "PATH",
-    I18n.t("logstash.agent.flag.pluginpath"),
-    :multivalued => true,
-    :attribute_name => :plugin_paths
+ option ["-p", "--pluginpath"] , "PATH",
+   I18n.t("logstash.agent.flag.pluginpath"),
+   :multivalued => true,
+   :attribute_name => :plugin_paths
 
   option ["-t", "--configtest"], :flag,
     I18n.t("logstash.agent.flag.configtest"),
@@ -85,23 +92,25 @@ class LogStash::Agent < Clamp::Command
     configure
 
     # You must specify a config_string or config_path
-    if config_string.nil? && config_path.nil?
+    if @config_string.nil? && @config_path.nil?
       fail(help + "\n" + I18n.t("logstash.agent.missing-configuration"))
     end
+
+    @config_string = @config_string.to_s
 
     if @config_path
       # Append the config string.
       # This allows users to provide both -f and -e flags. The combination
       # is rare, but useful for debugging.
-      @config_string = config_string + load_config(@config_path)
+      @config_string = @config_string + load_config(@config_path)
     else
       # include a default stdin input if no inputs given
       if @config_string !~ /input *{/
-        @config_string += "input { stdin { type => stdin } }"
+        @config_string += DEFAULT_INPUT
       end
       # include a default stdout output if no outputs given
       if @config_string !~ /output *{/
-        @config_string += "output { stdout { codec => rubydebug } }"
+        @config_string += DEFAULT_OUTPUT
       end
     end
 
@@ -112,8 +121,22 @@ class LogStash::Agent < Clamp::Command
     end
 
     # Make SIGINT shutdown the pipeline.
-    trap_id = Stud::trap("INT") do
-      @logger.warn(I18n.t("logstash.agent.interrupted"))
+    sigint_id = Stud::trap("INT") do
+
+      if @interrupted_once
+        @logger.fatal(I18n.t("logstash.agent.forced_sigint"))
+        exit
+      else
+        @logger.warn(I18n.t("logstash.agent.sigint"))
+        Thread.new(@logger) {|logger| sleep 5; logger.warn(I18n.t("logstash.agent.slow_shutdown")) }
+        @interrupted_once = true
+        pipeline.shutdown
+      end
+    end
+
+    # Make SIGTERM shutdown the pipeline.
+    sigterm_id = Stud::trap("TERM") do
+      @logger.warn(I18n.t("logstash.agent.sigterm"))
       pipeline.shutdown
     end
 
@@ -149,7 +172,8 @@ class LogStash::Agent < Clamp::Command
     return 1
   ensure
     @log_fd.close if @log_fd
-    Stud::untrap("INT", trap_id) unless trap_id.nil?
+    Stud::untrap("INT", sigint_id) unless sigint_id.nil?
+    Stud::untrap("TERM", sigterm_id) unless sigterm_id.nil?
   end # def execute
 
   def show_version
@@ -157,15 +181,8 @@ class LogStash::Agent < Clamp::Command
 
     if [:info, :debug].include?(verbosity?) || debug? || verbose?
       show_version_ruby
-
-      if RUBY_PLATFORM == "java"
-        show_version_java
-        show_version_elasticsearch
-      end
-
-      if [:debug].include?(verbosity?) || debug?
-        show_gems 
-      end
+      show_version_java if LogStash::Environment.jruby?
+      show_gems if [:debug].include?(verbosity?) || debug?
     end
   end # def show_version
 
@@ -177,20 +194,6 @@ class LogStash::Agent < Clamp::Command
   def show_version_ruby
     puts RUBY_DESCRIPTION
   end # def show_version_ruby
-
-  def show_version_elasticsearch
-    # Not running in the,jar? assume elasticsearch jars are
-    # in ../../vendor/jar/...
-    if __FILE__ !~ /^(?:jar:)?file:/
-      jarpath = File.join(File.dirname(__FILE__), "../../vendor/jar/elasticsearch*/lib/*.jar")
-      Dir.glob(jarpath).each do |jar|
-        require jar
-      end
-    end
-
-    $stdout.write("Elasticsearch: ");
-    org.elasticsearch.Version::main([])
-  end # def show_version_elasticsearch
 
   def show_version_java
     properties = java.lang.System.getProperties
@@ -210,7 +213,7 @@ class LogStash::Agent < Clamp::Command
   # Log file stuff, plugin path checking, etc.
   def configure
     configure_logging(log_file)
-    configure_plugin_path(plugin_paths) if !plugin_paths.nil?
+    configure_plugin_paths(plugin_paths)
   end # def configure
 
   # Point logging at a specific path.
@@ -236,7 +239,6 @@ class LogStash::Agent < Clamp::Command
       else
         @logger.level = :warn
       end
-
     end
 
     if log_file
@@ -261,34 +263,39 @@ class LogStash::Agent < Clamp::Command
     # http://jira.codehaus.org/browse/JRUBY-7003
   end # def configure_logging
 
-  # Validate and add any paths to the list of locations
-  # logstash will look to find plugins.
-  def configure_plugin_path(paths)
-    # Append any plugin paths to the ruby search path
-    paths.each do |path|
-      # Verify the path exists
-      if !Dir.exists?(path)
-        warn(I18n.t("logstash.agent.configuration.plugin_path_missing",
-                    :path => path))
-
-      end
-
-      # TODO(sissel): Verify the path looks like the correct form.
-      # aka, there must be file in path/logstash/{inputs,codecs,filters,outputs}/*.rb
-      plugin_glob = File.join(path, "logstash", "{inputs,codecs,filters,outputs}", "*.rb")
-      if Dir.glob(plugin_glob).empty?
-        @logger.warn(I18n.t("logstash.agent.configuration.no_plugins_found",
-                    :path => path, :plugin_glob => plugin_glob))
-      end
-
-      # We push plugin paths to the front of the LOAD_PATH so that folks
-      # can override any core logstash plugins if they need to.
-      @logger.debug("Adding plugin path", :path => path)
-      $LOAD_PATH.unshift(path)
+  # add the given paths for ungemified/bare plugins lookups
+  # @param paths [String, Array<String>] plugins path string or list of path strings to add
+  def configure_plugin_paths(paths)
+    Array(paths).each do |path|
+      fail(I18n.t("logstash.agent.configuration.plugin_path_missing", :path => path)) unless File.directory?(path)
+      LogStash::Environment.add_plugin_path(path)
     end
-  end # def configure_plugin_path
+  end
 
   def load_config(path)
+    begin
+      uri = URI.parse(path)
+
+      case uri.scheme
+      when nil then
+        local_config(path)
+      when /http/ then
+        fetch_config(uri)
+      when "file" then
+        local_config(uri.path)
+      else
+        fail(I18n.t("logstash.agent.configuration.scheme-not-supported", :path => path))
+      end
+    rescue URI::InvalidURIError
+      # fallback for windows.
+      # if the parsing of the file failed we assume we can reach it locally.
+      # some relative path on windows arent parsed correctly (.\logstash.conf)
+      local_config(path)
+    end
+  end
+
+  def local_config(path)
+    path = File.expand_path(path)
     path = File.join(path, "*") if File.directory?(path)
 
     if Dir.glob(path).length == 0
@@ -296,6 +303,7 @@ class LogStash::Agent < Clamp::Command
     end
 
     config = ""
+    encoding_issue_files = []
     Dir.glob(path).sort.each do |file|
       next unless File.file?(file)
       if file.match(/~$/)
@@ -303,9 +311,24 @@ class LogStash::Agent < Clamp::Command
         next
       end
       @logger.debug("Reading config file", :file => file)
-      config << File.read(file) + "\n"
+      cfg = File.read(file)
+      if !cfg.ascii_only? && !cfg.valid_encoding?
+        encoding_issue_files << file
+      end
+      config << cfg + "\n"
+    end
+    if (encoding_issue_files.any?)
+      fail("The following config files contains non-ascii characters but are not UTF-8 encoded #{encoding_issue_files}")
     end
     return config
   end # def load_config
+
+  def fetch_config(uri)
+    begin
+      Net::HTTP.get(uri) + "\n"
+    rescue Exception => e
+      fail(I18n.t("logstash.agent.configuration.fetch-failed", :path => uri.to_s, :message => e.message))
+    end
+  end
 
 end # class LogStash::Agent
